@@ -83,6 +83,7 @@ import com.querydsl.core.types.dsl.BooleanExpression;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.collections.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.logging.log4j.util.Strings;
 import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Conditional;
@@ -113,9 +114,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
-
-import static com.alibaba.nacos.config.server.service.repository.RowMapperManager.CONFIG_INFO_ROW_MAPPER;
-
 
 /**
  * External Storage Persist Service.
@@ -868,13 +866,13 @@ public class ExternalStoragePersistServiceImpl implements PersistService {
     private void buildConfigInfoCommonCondition(BooleanBuilder booleanBuilder, QConfigInfoEntity qConfigInfo,
             final String dataId, final String group, final String appName) {
         if (StringUtils.isNotBlank(dataId)) {
-            booleanBuilder.and(qConfigInfo.dataId.eq(dataId));
+            booleanBuilder.and(qConfigInfo.dataId.like(generateLikeArgument(dataId)));
         }
         if (StringUtils.isNotBlank(group)) {
-            booleanBuilder.and(qConfigInfo.groupId.eq(group));
+            booleanBuilder.and(qConfigInfo.groupId.like(generateLikeArgument(group)));
         }
         if (StringUtils.isNotBlank(appName)) {
-            booleanBuilder.and(qConfigInfo.appName.eq(appName));
+            booleanBuilder.and(qConfigInfo.appName.like(generateLikeArgument(appName)));
         }
     }
     
@@ -958,7 +956,7 @@ public class ExternalStoragePersistServiceImpl implements PersistService {
         final String appName = configAdvanceInfo == null ? null : (String) configAdvanceInfo.get("appName");
         final String configTags = configAdvanceInfo == null ? null : (String) configAdvanceInfo.get("config_tags");
         BooleanBuilder booleanBuilder = new BooleanBuilder();
-
+        
         booleanBuilder.and(qConfigInfo.tenantId.eq(tenantTmp));
         if (StringUtils.isNotBlank(configTags)) {
             List<Long> configTagsRelationIds = new ArrayList<>();
@@ -1198,13 +1196,79 @@ public class ExternalStoragePersistServiceImpl implements PersistService {
     @Override
     public List<ConfigInfo> findConfigInfoByBatch(final List<String> dataIds, final String group, final String tenant,
             int subQueryLimit) {
-      return null;
+        // assert dataids group not null
+        String tenantTmp = StringUtils.isBlank(tenant) ? StringUtils.EMPTY : tenant;
+        // if dataids empty return empty list
+        if (CollectionUtils.isEmpty(dataIds)) {
+            return Collections.emptyList();
+        }
+        
+        // Volume query upper limit
+        // The number of in is within 100. The shorter the SQL statement, the better
+        if (subQueryLimit > QUERY_LIMIT_SIZE) {
+            subQueryLimit = 50;
+        }
+        List<ConfigInfo> result = new ArrayList<ConfigInfo>(dataIds.size());
+        
+        QConfigInfoEntity qConfigInfoEntity = QConfigInfoEntity.configInfoEntity;
+        for (int i = 0; i < dataIds.size(); i += subQueryLimit) {
+            // dataids
+            List<String> params = new ArrayList<String>(
+                    dataIds.subList(i, Math.min(i + subQueryLimit, dataIds.size())));
+            
+            // group
+            params.add(0, group);
+            params.add(1, tenantTmp);
+            
+            final BooleanExpression expression = qConfigInfoEntity.groupId.eq(group).and(qConfigInfoEntity.tenantId.eq(tenantTmp))
+                    .and(qConfigInfoEntity.dataId.in(params));
+            Iterable<ConfigInfoEntity> iterable = configInfoRepository.findAll(expression);
+            List<ConfigInfo> r = ConfigInfoMapStruct.INSTANCE
+                    .convertConfigInfoList2((List<ConfigInfoEntity>) iterable);
+            
+            // assert not null
+            if (r != null && r.size() > 0) {
+                result.addAll(r);
+            }
+        }
+        return result;
     }
     
     @Override
     public Page<ConfigInfo> findConfigInfoLike(final int pageNo, final int pageSize, final String dataId,
             final String group, final String tenant, final String appName, final String content) {
-        return null;
+        String tenantTmp = StringUtils.isBlank(tenant) ? StringUtils.EMPTY : tenant;
+        if (StringUtils.isBlank(dataId) && StringUtils.isBlank(group)) {
+            if (StringUtils.isBlank(appName)) {
+                return this.findAllConfigInfo(pageNo, pageSize, tenantTmp);
+            } else {
+                return this.findConfigInfoByApp(pageNo, pageSize, tenantTmp, appName);
+            }
+        }
+        QConfigInfoEntity qConfigInfoEntity = QConfigInfoEntity.configInfoEntity;
+        BooleanBuilder booleanBuilder = new BooleanBuilder();
+    
+        if (!StringUtils.isBlank(dataId)) {
+           booleanBuilder.and(qConfigInfoEntity.dataId.like(generateLikeArgument(dataId)));
+        }
+        if (!StringUtils.isBlank(group)) {
+            booleanBuilder.and(qConfigInfoEntity.groupId.like(generateLikeArgument(group)));
+        }
+        booleanBuilder.and(qConfigInfoEntity.tenantId.like(generateLikeArgument(tenantTmp)));
+        if (!StringUtils.isBlank(appName)) {
+            booleanBuilder.and(qConfigInfoEntity.appName.eq(appName));
+        }
+        if (!StringUtils.isBlank(content)) {
+            booleanBuilder.and(qConfigInfoEntity.content.like(generateLikeArgument(content)));
+        }
+        org.springframework.data.domain.Page<ConfigInfoEntity> sPage = configInfoRepository
+                .findAll(booleanBuilder, PageRequest.of((pageNo - 1) * pageSize, pageSize));
+        Page<ConfigInfo> page = new Page<>();
+        page.setPageNumber(sPage.getNumber());
+        page.setPagesAvailable(sPage.getTotalPages());
+        page.setPageItems(ConfigInfoMapStruct.INSTANCE.convertConfigInfoList2(sPage.getContent()));
+        page.setTotalCount((int) sPage.getTotalElements());
+        return page;
     }
     
     @Override
@@ -1224,13 +1288,13 @@ public class ExternalStoragePersistServiceImpl implements PersistService {
         QConfigInfoEntity qConfigInfo = QConfigInfoEntity.configInfoEntity;
         buildConfigInfoCommonCondition(booleanBuilder, qConfigInfo, dataId, group, appName);
         if (StringUtils.isNotBlank(tenant)) {
-            booleanBuilder.and(qConfigInfo.tenantId.like(tenant));
+            booleanBuilder.and(qConfigInfo.tenantId.like(generateLikeArgument(tenant)));
         }
         if (StringUtils.isNotBlank(content)) {
-            booleanBuilder.and(qConfigInfo.content.like(content));
+            booleanBuilder.and(qConfigInfo.content.like(generateLikeArgument(content)));
         }
         org.springframework.data.domain.Page<ConfigInfoEntity> sPage = configInfoRepository
-                .findAll(booleanBuilder, PageRequest.of(pageNo, pageSize, Sort.by(Sort.Order.desc("gmtCreate"))));
+                .findAll(booleanBuilder, PageRequest.of((pageNo - 1) * pageSize, pageSize, Sort.by(Sort.Order.desc("gmtCreate"))));
         Page<ConfigInfo> page = new Page<>();
         page.setPageNumber(sPage.getNumber());
         page.setPagesAvailable(sPage.getTotalPages());
@@ -1242,7 +1306,32 @@ public class ExternalStoragePersistServiceImpl implements PersistService {
     @Override
     public Page<ConfigInfoBase> findConfigInfoBaseLike(final int pageNo, final int pageSize, final String dataId,
             final String group, final String content) throws IOException {
-        return null;
+        if (StringUtils.isBlank(dataId) && StringUtils.isBlank(group)) {
+            throw new IOException("invalid param");
+        }
+        
+        BooleanBuilder booleanBuilder = new BooleanBuilder();
+        QConfigInfoEntity qConfigInfoEntity = QConfigInfoEntity.configInfoEntity;
+        booleanBuilder.and(qConfigInfoEntity.tenantId.eq(Strings.EMPTY));
+        if (!StringUtils.isBlank(dataId)) {
+            booleanBuilder.and(qConfigInfoEntity.dataId.like(generateLikeArgument(dataId)));
+        }
+        if (!StringUtils.isBlank(group)) {
+            booleanBuilder.and(qConfigInfoEntity.groupId.like(generateLikeArgument(group)));
+        }
+        if (!StringUtils.isBlank(content)) {
+            booleanBuilder.and(qConfigInfoEntity.content.like(generateLikeArgument(content)));
+        }
+    
+    
+        org.springframework.data.domain.Page<ConfigInfoEntity> sPage = configInfoRepository
+                .findAll(booleanBuilder, PageRequest.of(pageNo, pageSize, Sort.by(Sort.Order.desc("gmtCreate"))));
+        Page<ConfigInfoBase> page = new Page<>();
+        page.setPageNumber(sPage.getNumber());
+        page.setPagesAvailable(sPage.getTotalPages());
+        page.setPageItems(ConfigInfoEntityMapStruct.INSTANCE.convertConfigInfoBaseList(sPage.getContent()));
+        page.setTotalCount((int) sPage.getTotalElements());
+        return page;
     }
     
     @Override
